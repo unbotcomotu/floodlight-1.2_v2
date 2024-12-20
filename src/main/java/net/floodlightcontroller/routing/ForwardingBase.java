@@ -360,7 +360,7 @@ public abstract class ForwardingBase implements IOFMessageListener {
 		if(puertoTCP!=0){
 			mb.setExact(MatchField.ETH_TYPE, EthType.IPv4);
 			mb.setExact(MatchField.IP_PROTO, IpProtocol.TCP);
-			mb.setExact(MatchField.TCP_DST, TransportPort.of(puertoTCP));
+			mb.setExact(MatchField.TCP_SRC, TransportPort.of(puertoTCP));
 		}
 		aob.setPort(outPort);
 		aob.setMaxLen(Integer.MAX_VALUE);
@@ -431,7 +431,7 @@ public abstract class ForwardingBase implements IOFMessageListener {
 		if(puertoTCP!=0){
 			mb.setExact(MatchField.ETH_TYPE, EthType.IPv4);
 			mb.setExact(MatchField.IP_PROTO, IpProtocol.TCP);
-			mb.setExact(MatchField.TCP_SRC, TransportPort.of(puertoTCP));
+			mb.setExact(MatchField.TCP_DST, TransportPort.of(puertoTCP));
 		}
 		aob.setPort(outPort);
 		aob.setMaxLen(Integer.MAX_VALUE);
@@ -516,7 +516,7 @@ public abstract class ForwardingBase implements IOFMessageListener {
 		if(puertoTCP!=0){
 			mb.setExact(MatchField.ETH_TYPE, EthType.IPv4);
 			mb.setExact(MatchField.IP_PROTO, IpProtocol.TCP);
-			mb.setExact(MatchField.TCP_DST, TransportPort.of(puertoTCP));
+			mb.setExact(MatchField.TCP_SRC, TransportPort.of(puertoTCP));
 		}
 		aob.setPort(outPort);
 		aob.setMaxLen(Integer.MAX_VALUE);
@@ -601,7 +601,7 @@ public abstract class ForwardingBase implements IOFMessageListener {
 		if(puertoTCP!=0){
 			mb.setExact(MatchField.ETH_TYPE, EthType.IPv4);
 			mb.setExact(MatchField.IP_PROTO, IpProtocol.TCP);
-			mb.setExact(MatchField.TCP_SRC, TransportPort.of(puertoTCP));
+			mb.setExact(MatchField.TCP_DST, TransportPort.of(puertoTCP));
 		}
 		aob.setPort(outPort);
 		aob.setMaxLen(Integer.MAX_VALUE);
@@ -669,7 +669,7 @@ public abstract class ForwardingBase implements IOFMessageListener {
 		if(puertoTCP!=0){
 			mb.setExact(MatchField.ETH_TYPE, EthType.IPv4);
 			mb.setExact(MatchField.IP_PROTO, IpProtocol.TCP);
-			mb.setExact(MatchField.TCP_DST, TransportPort.of(puertoTCP));
+			mb.setExact(MatchField.TCP_SRC, TransportPort.of(puertoTCP));
 		}
 		OFPort outPort = switchPortList.get(indx+1).getPortId();
 		OFPort inPort = switchPortList.get(indx).getPortId();
@@ -733,7 +733,7 @@ public abstract class ForwardingBase implements IOFMessageListener {
 		if(puertoTCP!=0){
 			mb.setExact(MatchField.ETH_TYPE, EthType.IPv4);
 			mb.setExact(MatchField.IP_PROTO, IpProtocol.TCP);
-			mb.setExact(MatchField.TCP_SRC, TransportPort.of(puertoTCP));
+			mb.setExact(MatchField.TCP_DST, TransportPort.of(puertoTCP));
 		}
 		OFPort outPort = switchPortList.get(indx).getPortId();
 		OFPort inPort = switchPortList.get(indx+1).getPortId();

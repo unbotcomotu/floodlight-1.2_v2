@@ -62,21 +62,10 @@ import org.projectfloodlight.openflow.protocol.OFPacketOut;
 import org.projectfloodlight.openflow.protocol.OFPortDesc;
 import org.projectfloodlight.openflow.protocol.OFVersion;
 import org.projectfloodlight.openflow.protocol.action.OFAction;
+import org.projectfloodlight.openflow.protocol.instruction.OFInstruction;
 import org.projectfloodlight.openflow.protocol.match.Match;
 import org.projectfloodlight.openflow.protocol.match.MatchField;
-import org.projectfloodlight.openflow.types.DatapathId;
-import org.projectfloodlight.openflow.types.EthType;
-import org.projectfloodlight.openflow.types.IPv4Address;
-import org.projectfloodlight.openflow.types.IPv6Address;
-import org.projectfloodlight.openflow.types.IpProtocol;
-import org.projectfloodlight.openflow.types.MacAddress;
-import org.projectfloodlight.openflow.types.OFBufferId;
-import org.projectfloodlight.openflow.types.OFGroup;
-import org.projectfloodlight.openflow.types.OFPort;
-import org.projectfloodlight.openflow.types.OFVlanVidMatch;
-import org.projectfloodlight.openflow.types.TableId;
-import org.projectfloodlight.openflow.types.U64;
-import org.projectfloodlight.openflow.types.VlanVid;
+import org.projectfloodlight.openflow.types.*;
 import org.python.antlr.ast.Str;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -85,7 +74,7 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 	protected static Logger log = LoggerFactory.getLogger(Forwarding.class);
 
 	private final ConcurrentHashMap<String, Long> connectionRequests = new ConcurrentHashMap<>();
-	private static final long TIMEOUT_MS = 5000;
+	private static final long TIMEOUT_MS = 1000;
 
 	private String generateConnectionKey(String macSrc, String macDst) {
 		return macSrc + "->" + macDst;
@@ -174,22 +163,6 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 		Integer priority=100;
 		Ethernet eth = IFloodlightProviderService.bcStore.get(cntx, IFloodlightProviderService.CONTEXT_PI_PAYLOAD);
 
-// Obtener direcciones MAC de origen y destino
-		String macSrc = eth.getSourceMACAddress().toString();
-		String macDst = eth.getDestinationMACAddress().toString();
-
-		// Generar clave para la conexión
-		String connectionKey = generateConnectionKey(macSrc, macDst);
-		String connectionKeyInversed = generateConnectionKey(macDst, macSrc);
-
-		// Verificar si la conexión ya fue procesada
-		Long timestamp = connectionRequests.get(connectionKeyInversed);
-		long currentTime = System.currentTimeMillis();
-
-		if (timestamp != null && (currentTime - timestamp) < TIMEOUT_MS) {
-			log.info("Solicitud de conexión ya procesada para {}", connectionKey);
-			return;
-		}
 
 
 		if (dstDevice != null) {
@@ -264,55 +237,66 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 				return; 
 			}
 
-			IDevice srcDeviceAux=dstDevice;
-			IDevice dstDeviceAux=srcDevice;
+			String macSrc = eth.getSourceMACAddress().toString();
+			String macDst = eth.getDestinationMACAddress().toString();
+
+			// Generar clave para la conexión
+			String connectionKey = generateConnectionKey(macSrc, macDst);
+			String connectionKeyInversed = generateConnectionKey(macDst, macSrc);
+
+			// Verificar si la conexión ya fue procesada
+			Long timestamp = connectionRequests.get(connectionKeyInversed);
+			long currentTime = System.currentTimeMillis();
+
+
 
 			log.info("----- Solicitud PACKET-IN entre "+srcDevice.getMACAddressString()+" y "+dstDevice.getMACAddressString()+" -----");
-			log.info("----- El motivo es una comunicación entre "+srcDeviceAux.getMACAddressString()+" y "+dstDeviceAux.getMACAddressString()+" -----");
+			log.info("----- El motivo es una comunicación entre "+srcDevice.getMACAddressString()+" y "+dstDevice.getMACAddressString()+" -----");
 
 			Boolean hostOrigenInvitado=false;
 			Boolean hostDestinoInvitado=false;
 
-			Map<String,Object> dispositivoOrigenResponse=(Map<String,Object>) HTTPRequests.obtenerDispositivo(srcDeviceAux.getMACAddressString());
+			Map<String,Object> dispositivoOrigenResponse=(Map<String,Object>) HTTPRequests.obtenerDispositivo(srcDevice.getMACAddressString());
 			String status=(String) dispositivoOrigenResponse.get("status");
 			log.info("----- STATUS src: "+status+" -----");
 			if(status.equals("error")){
 				hostOrigenInvitado=true;
-				HTTPRequests.registrarDispositivoInvitado(srcDeviceAux.getMACAddressString());
-				log.info("----- Se registró un nuevo dispositivo origen invitado: "+srcDeviceAux.getMACAddressString()+" -----");
+				HTTPRequests.registrarDispositivoInvitado(srcDevice.getMACAddressString());
+				log.info("----- Se registró un nuevo dispositivo origen invitado: "+srcDevice.getMACAddressString()+" -----");
 			}else{
 				Map<String,Object>dispositivo=(Map<String,Object>)dispositivoOrigenResponse.get("content");
 				Object usuario=dispositivo.get("usuario");
+				Integer autenticado = ((Double) dispositivo.get("autenticado")).intValue();
 				if(usuario==null){
 					hostOrigenInvitado=true;
-					log.info("----- El dispositivo origen está registrado como invitado: "+srcDeviceAux.getMACAddressString()+" -----");
-				}else if(dispositivo.get("autenticado").equals(0)){
+					log.info("----- El dispositivo origen está registrado como invitado: "+srcDevice.getMACAddressString()+" -----");
+				}else if(autenticado==0){
 					hostOrigenInvitado=true;
-					log.info("----- El dispositivo origen no ha sido autenticado por su usuario: "+srcDeviceAux.getMACAddressString()+" -----");
+					log.info("----- El dispositivo origen no ha sido autenticado por su usuario: "+srcDevice.getMACAddressString()+" -----");
 				}else {
 					Map<String,Object>enSesionResponse=(Map<String, Object>) HTTPRequests.verificarUsuarioEnSesion((String) ((Map<String,Object>)usuario).get("username"));
 					if(enSesionResponse.get("status").equals("error")){
-						log.info("----- El usuario que registró al dispositivo origen no está en sesión: "+srcDeviceAux.getMACAddressString()+" -----");
+						log.info("----- El usuario que registró al dispositivo origen no está en sesión: "+srcDevice.getMACAddressString()+" -----");
 						hostOrigenInvitado=true;
 					}else {
-						log.info("----- El dispositivo origen pasará a una segunda validación: "+srcDeviceAux.getMACAddressString()+" -----");
+						log.info("----- El dispositivo origen pasará a una segunda validación: "+srcDevice.getMACAddressString()+" -----");
 					}
 				}
 			}
 
-			Map<String,Object> dispositivoDestinoResponse=(Map<String,Object>)HTTPRequests.obtenerDispositivo(dstDeviceAux.getMACAddressString());
+			Map<String,Object> dispositivoDestinoResponse=(Map<String,Object>)HTTPRequests.obtenerDispositivo(dstDevice.getMACAddressString());
 			status=(String) dispositivoDestinoResponse.get("status");
 			log.info("----- STATUS dst: "+status+" -----");
 			if(status.equals("error")){
 				hostDestinoInvitado=true;
-				HTTPRequests.registrarDispositivoInvitado(dstDeviceAux.getMACAddressString());
-				log.info("----- Se registró un nuevo dispositivo destino invitado: "+dstDeviceAux.getMACAddressString()+" -----");
+				HTTPRequests.registrarDispositivoInvitado(dstDevice.getMACAddressString());
+				log.info("----- Se registró un nuevo dispositivo destino invitado: "+dstDevice.getMACAddressString()+" -----");
 			}else{
 				Map<String,Object>dispositivo=(Map<String,Object>)dispositivoDestinoResponse.get("content");
 				Object usuario=dispositivo.get("usuario");
 				Integer autenticado = ((Double) dispositivo.get("autenticado")).intValue();
 				if(usuario==null){
-					log.info("----- El dispositivo destino está registrado como invitado: "+dstDeviceAux.getMACAddressString()+" -----");
+					log.info("----- El dispositivo destino está registrado como invitado: "+dstDevice.getMACAddressString()+" -----");
 					hostDestinoInvitado=true;
 				}else if(autenticado==0||autenticado==1){
 					log.info("----- El dispositivo destino no ha sido autenticado por su usuario o este desea que sea accesible como invitado: "+dstDevice.getMACAddressString()+" -----");
@@ -321,9 +305,9 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 					Map<String,Object>enSesionResponse=(Map<String, Object>) HTTPRequests.verificarUsuarioEnSesion((String) ((Map<String,Object>)usuario).get("username"));
 					if(enSesionResponse.get("status").equals("error")){
 						hostOrigenInvitado=true;
-						log.info("----- El usuario que registró al dispositivo destino no está en sesión: "+dstDeviceAux.getMACAddressString()+" -----");
+						log.info("----- El usuario que registró al dispositivo destino no está en sesión: "+dstDevice.getMACAddressString()+" -----");
 					}else {
-						log.info("----- El dispositivo destino pasará a una segunda validación: "+dstDeviceAux.getMACAddressString()+" -----");
+						log.info("----- El dispositivo destino pasará a una segunda validación: "+dstDevice.getMACAddressString()+" -----");
 					}
 				}
 			}
@@ -347,7 +331,7 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 					// Obtener el puerto destino
 					puertoDestino = tcp.getDestinationPort().getPort();
 
-					log.info("Puerto TCP destino: {}", puertoDestino);
+					log.info("----- Puerto TCP destino: {"+puertoDestino+"} -----");
 				}
 			}
 
@@ -361,19 +345,26 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 				if(hostDestinoInvitado){
 					idVlan=1;
 				}else {
-					Map<String,Object>vinculoResponse=(Map<String, Object>) HTTPRequests.obtenerVinculoTerminales(srcDeviceAux.getMACAddressString(),dstDeviceAux.getMACAddressString());
+					Map<String,Object>vinculoResponse=(Map<String, Object>) HTTPRequests.obtenerVinculoTerminales(srcDevice.getMACAddressString(),dstDevice.getMACAddressString());
 					Map<String,Object>content=(Map<String,Object>) vinculoResponse.get("content");
 					Map<String,Object>servicio=(Map<String,Object>) content.get("servicio");
 					if(servicio!=null){
 						idVlan=((Double) servicio.get("id")).intValue();
 						nombreServicio=(String) servicio.get("nombre");
-						List<Integer>listaPuertosServicio=(List<Integer>)servicio.get("puertos");
+						log.info("----- Servicio encontrado: "+nombreServicio+" - "+idVlan+" -----");
+						List<Double>listaPuertosServicio=(List<Double>)servicio.get("puertos");
+						log.info("----- Puertos que ofrece el servicio: "+listaPuertosServicio);
 						if(listaPuertosServicio.isEmpty()){
 							puerto=0;
 						}else {
-							if(listaPuertosServicio.contains(puertoDestino)){
-								puerto=puertoDestino;
-							}else {
+							Boolean puertoEncontrado=false;
+							for(Double i:listaPuertosServicio){
+								if(i.intValue()==puertoDestino){
+									puertoEncontrado=true;
+									puerto=puertoDestino;
+								}
+							}
+							if(!puertoEncontrado){
 								puerto=null;
 							}
 						}
@@ -383,20 +374,18 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 
 			if(idVlan==null){
 				log.error("----- No se obtuvo un valor de ID VLAN válido. No se puede establecer una conexión con el destino -----");
-				// Agregar la conexión al registro
-				connectionRequests.put(connectionKey, currentTime);
+				addDropRuleForMacs(sw, eth.getSourceMACAddress(), eth.getDestinationMACAddress(), inPort, puertoDestino);
 				return;
 			}else {
 				if(puerto==null){
 					log.error("----- El puerto destino no es permitido. No se puede establecer una conexión con el destino -----");
-					// Agregar la conexión al registro
-					connectionRequests.put(connectionKey, currentTime);
+					addDropRuleForMacs(sw, eth.getSourceMACAddress(), eth.getDestinationMACAddress(), inPort, puertoDestino);
 					return;
 				}
 			}
 			log.info("----- Servicio en comun: "+(nombreServicio==null?"Invitado":nombreServicio)+" con ID VLAN: "+idVlan+" y puerto "+(puerto==0?"0 (todos los puertos)":puerto)+" -----");
 
-			log.info("----- Se está iniciando la creación de una conexión entre "+srcDeviceAux.getMACAddressString()+" y "+dstDeviceAux.getMACAddressString()+" -----");
+			log.info("----- Se está iniciando la creación de una conexión entre "+srcDevice.getMACAddressString()+" y "+dstDevice.getMACAddressString()+" -----");
 
 
 
@@ -449,8 +438,8 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 						priority,
 						puerto);
 			}
-			HTTPRequests.registrarNuevaConexion(srcDeviceAux.getMACAddressString(), dstDeviceAux.getMACAddressString(),idVlan,puerto,idleTimeout);
-			System.out.println("----- Se estableció una conexión entre "+srcDeviceAux.getMACAddressString()+" y "+dstDeviceAux.getMACAddressString()+" -----");
+			HTTPRequests.registrarNuevaConexion(srcDevice.getMACAddressString(), dstDevice.getMACAddressString(),idVlan,puerto,idleTimeout);
+			System.out.println("----- Se estableció una conexión entre "+srcDevice.getMACAddressString()+" y "+dstDevice.getMACAddressString()+" -----");
 
 		} else {
 			log.debug("Destination unknown. Flooding packet");
@@ -797,5 +786,61 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 			log.error("Error al instalar regla de Flooding ARP instalada en el switch {}", sw.getId(), e);
 		}
 	}
+
+	private void addDropRuleForMacs(IOFSwitch sw, MacAddress srcMac, MacAddress dstMac, OFPort inPort, Integer puertoDestino) {
+		Logger log = LoggerFactory.getLogger(this.getClass());
+
+		// Crear el Match utilizando el método actualizado
+		Match match = buildMatchWithTCP(sw, srcMac, dstMac, inPort, puertoDestino);
+
+		// Crear la regla de flujo para hacer DROP
+		OFFlowMod.Builder flowBuilder = sw.getOFFactory().buildFlowAdd();
+		List<OFAction> actions = new ArrayList<>(); // Lista vacía -> DROP
+
+		flowBuilder.setCookie(AppCookie.makeCookie(FORWARDING_APP_ID, 0)) // Identificador único para la regla
+				.setHardTimeout(5) // Tiempo de vida fijo
+				.setIdleTimeout(5) // Tiempo de inactividad
+				.setPriority(100) // Prioridad alta
+				.setBufferId(OFBufferId.NO_BUFFER) // Sin buffer
+				.setMatch(match); // Establecer el Match
+
+		// Usar el método setActions para manejar versiones de OpenFlow
+		FlowModUtils.setActions(flowBuilder, actions, sw);
+
+		// Intentar instalar la regla en el switch
+		try {
+			sw.write(flowBuilder.build());
+			log.info("Regla de DROP instalada por 5 segundos en el switch "+sw.getId()+" para ETH_SRC="+srcMac+" y ETH_DST="+dstMac+" con puerto "+(puertoDestino == null ? "todos" : puertoDestino));
+
+		} catch (Exception e) {
+			log.error("Error al instalar la regla de DROP en el switch {}: {}", sw.getId(), e.getMessage());
+		}
+	}
+
+
+
+	private Match buildMatchWithTCP(IOFSwitch sw, MacAddress srcMac, MacAddress dstMac, OFPort inPort, Integer puertoDestino) {
+		Match.Builder matchBuilder = sw.getOFFactory().buildMatch();
+
+		// Establecer MAC origen y destino
+		matchBuilder.setExact(MatchField.ETH_SRC, srcMac)
+				.setExact(MatchField.ETH_DST, dstMac)
+				.setExact(MatchField.IN_PORT, inPort);
+
+		// Establecer el tipo de paquete como IPv4
+		matchBuilder.setExact(MatchField.ETH_TYPE, EthType.IPv4);
+
+		// Establecer el protocolo como TCP
+		matchBuilder.setExact(MatchField.IP_PROTO, IpProtocol.TCP);
+
+		// Si se especifica un puerto TCP de destino, agregarlo
+		if (puertoDestino != null) {
+			matchBuilder.setExact(MatchField.TCP_SRC, TransportPort.of(puertoDestino));
+		}
+
+		return matchBuilder.build();
+	}
+
+
 
 }
