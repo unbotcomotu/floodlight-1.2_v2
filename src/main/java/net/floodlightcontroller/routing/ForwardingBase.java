@@ -59,11 +59,7 @@ import org.projectfloodlight.openflow.protocol.OFType;
 import org.projectfloodlight.openflow.protocol.OFVersion;
 import org.projectfloodlight.openflow.protocol.action.OFAction;
 import org.projectfloodlight.openflow.protocol.action.OFActionOutput;
-import org.projectfloodlight.openflow.types.DatapathId;
-import org.projectfloodlight.openflow.types.MacAddress;
-import org.projectfloodlight.openflow.types.OFBufferId;
-import org.projectfloodlight.openflow.types.OFPort;
-import org.projectfloodlight.openflow.types.U64;
+import org.projectfloodlight.openflow.types.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -294,7 +290,503 @@ public abstract class ForwardingBase implements IOFMessageListener {
 
 		return packetOutSent;
 	}
-	
+
+	public boolean insertarRutas(Route route, Match match, OFPacketIn pi,
+							 DatapathId pinSwitch, U64 cookie, FloodlightContext cntx,
+							 boolean requestFlowRemovedNotification, OFFlowModCommand flowModCommand,MacAddress macDestino,MacAddress macOrigen,Integer idleTimeout,Integer hardTimeout,Integer idVlan,Integer priority,Integer puertoTCP) {
+
+		boolean packetOutSent = false;
+
+		List<NodePortTuple> switchPortList = route.getPath();
+
+		for (int indx = 0; indx < switchPortList.size()-1; indx += 2) {
+			// indx and indx-1 will always have the same switch DPID.
+			DatapathId switchDPID = switchPortList.get(indx).getNodeId();
+			IOFSwitch sw = switchService.getSwitch(switchDPID);
+
+			if (sw == null) {
+				if (log.isWarnEnabled()) {
+					log.warn("Unable to push route, switch at DPID {} " + "not available", switchDPID);
+				}
+				return packetOutSent;
+			}
+
+			// need to build flow mod based on what type it is. Cannot set command later
+			OFFlowMod.Builder fmb;
+			switch (flowModCommand) {
+				case ADD:
+					fmb = sw.getOFFactory().buildFlowAdd();
+					break;
+				case DELETE:
+					fmb = sw.getOFFactory().buildFlowDelete();
+					break;
+				case DELETE_STRICT:
+					fmb = sw.getOFFactory().buildFlowDeleteStrict();
+					break;
+				case MODIFY:
+					fmb = sw.getOFFactory().buildFlowModify();
+					break;
+				default:
+					log.error("Could not decode OFFlowModCommand. Using MODIFY_STRICT. (Should another be used as the default?)");
+				case MODIFY_STRICT:
+					fmb = sw.getOFFactory().buildFlowModifyStrict();
+					break;
+			}
+			if(indx==0){
+				packetOutSent=insertarRutaSwitchFinalRegreso(macDestino,macOrigen,sw,match,switchPortList,requestFlowRemovedNotification,fmb,packetOutSent,idVlan,indx,idleTimeout,hardTimeout,priority,cookie,pinSwitch,pi,cntx,puertoTCP);
+				packetOutSent=insertarRutaSwitchInicialIda(macOrigen,macDestino,sw,match,switchPortList,requestFlowRemovedNotification,fmb,packetOutSent,idVlan,indx,idleTimeout,hardTimeout,priority,cookie,pinSwitch,pi,cntx,puertoTCP);
+			}else if(indx==switchPortList.size()-2){
+				packetOutSent=insertarRutaSwitchInicialRegreso(macDestino,macOrigen,sw,match,switchPortList,requestFlowRemovedNotification,fmb,packetOutSent,idVlan,indx,idleTimeout,hardTimeout,priority,cookie,pinSwitch,pi,cntx,puertoTCP);
+				packetOutSent=insertarRutaSwitchFinalIda(macOrigen,macDestino,sw,match,switchPortList,requestFlowRemovedNotification,fmb,packetOutSent,idVlan,indx,idleTimeout,hardTimeout,priority,cookie,pinSwitch,pi,cntx,puertoTCP);
+			}else {
+				packetOutSent=insertarRutaSwitchIntermedioIda(macOrigen,macDestino,sw,match,switchPortList,requestFlowRemovedNotification,fmb,packetOutSent,idVlan,indx,idleTimeout,hardTimeout,priority,cookie,pinSwitch,pi,cntx,puertoTCP);
+				packetOutSent=insertarRutaSwitchIntermedioRegreso(macDestino,macOrigen,sw,match,switchPortList,requestFlowRemovedNotification,fmb,packetOutSent,idVlan,indx,idleTimeout,hardTimeout,priority,cookie,pinSwitch,pi,cntx,puertoTCP);
+			}
+		}
+
+		return packetOutSent;
+	}
+
+	public boolean insertarRutaSwitchIntermedioIda(MacAddress macOrigen,MacAddress macDestino,IOFSwitch sw,Match match,List<NodePortTuple>switchPortList,boolean requestFlowRemovedNotification,OFFlowMod.Builder fmb,boolean packetOutSent,Integer idVlan,Integer indx,Integer idleTimeout,Integer hardTimeout,Integer priority,U64 cookie,DatapathId pinSwitch,OFPacketIn pi,FloodlightContext cntx,Integer puertoTCP){
+		OFActionOutput.Builder aob = sw.getOFFactory().actions().buildOutput();
+		List<OFAction> actions = new ArrayList<OFAction>();
+		Match.Builder mb = MatchUtils.convertToVersion(match, sw.getOFFactory().getVersion());
+
+		// set input and output ports on the switch
+		OFPort outPort = switchPortList.get(indx+1).getPortId();
+		OFPort inPort = switchPortList.get(indx).getPortId();
+		mb.setExact(MatchField.VLAN_VID, OFVlanVidMatch.ofVlan(idVlan));
+		mb.setExact(MatchField.ETH_DST,macDestino);
+		if(puertoTCP!=0){
+			mb.setExact(MatchField.ETH_TYPE, EthType.IPv4);
+			mb.setExact(MatchField.IP_PROTO, IpProtocol.TCP);
+			mb.setExact(MatchField.TCP_DST, TransportPort.of(puertoTCP));
+		}
+		aob.setPort(outPort);
+		aob.setMaxLen(Integer.MAX_VALUE);
+		actions.add(aob.build());
+
+		if (FLOWMOD_DEFAULT_SET_SEND_FLOW_REM_FLAG || requestFlowRemovedNotification) {
+			Set<OFFlowModFlags> flags = new HashSet<>();
+			flags.add(OFFlowModFlags.SEND_FLOW_REM);
+			fmb.setFlags(flags);
+		}
+
+		fmb.setMatch(mb.build())
+				.setIdleTimeout(idleTimeout)
+				.setHardTimeout(hardTimeout)
+				.setBufferId(OFBufferId.NO_BUFFER)
+				.setCookie(cookie)
+				.setOutPort(outPort)
+				.setPriority(priority);
+
+		FlowModUtils.setActions(fmb, actions, sw);
+
+		try {
+			if (log.isTraceEnabled()) {
+				log.trace("Pushing Route flowmod routeIndx={} " +
+								"sw={} inPort={} outPort={}",
+						new Object[] {indx,
+								sw,
+								fmb.getMatch().get(MatchField.IN_PORT),
+								outPort });
+			}
+
+			if (OFDPAUtils.isOFDPASwitch(sw)) {
+				OFDPAUtils.addLearningSwitchFlow(sw, cookie,
+						FLOWMOD_DEFAULT_PRIORITY,
+						FLOWMOD_DEFAULT_HARD_TIMEOUT,
+						FLOWMOD_DEFAULT_IDLE_TIMEOUT,
+						fmb.getMatch(),
+						null, // TODO how to determine output VLAN for lookup of L2 interface group
+						outPort);
+			} else {
+				messageDamper.write(sw, fmb.build());
+			}
+
+			/* Push the packet out the first hop switch */
+			if (sw.getId().equals(pinSwitch) &&
+					!fmb.getCommand().equals(OFFlowModCommand.DELETE) &&
+					!fmb.getCommand().equals(OFFlowModCommand.DELETE_STRICT)) {
+				/* Use the buffered packet at the switch, if there's one stored */
+				pushPacket(sw, pi, outPort, true, cntx);
+				packetOutSent = true;
+			}
+		} catch (IOException e) {
+			log.error("Failure writing flow mod", e);
+		}
+		return packetOutSent;
+	}
+
+	public boolean insertarRutaSwitchIntermedioRegreso(MacAddress macOrigen,MacAddress macDestino,IOFSwitch sw,Match match,List<NodePortTuple>switchPortList,boolean requestFlowRemovedNotification,OFFlowMod.Builder fmb,boolean packetOutSent,Integer idVlan,Integer indx,Integer idleTimeout,Integer hardTimeout,Integer priority,U64 cookie,DatapathId pinSwitch,OFPacketIn pi,FloodlightContext cntx,Integer puertoTCP){
+		OFActionOutput.Builder aob = sw.getOFFactory().actions().buildOutput();
+		List<OFAction> actions = new ArrayList<OFAction>();
+		Match.Builder mb = MatchUtils.convertToVersion(match, sw.getOFFactory().getVersion());
+
+		// set input and output ports on the switch
+		OFPort outPort = switchPortList.get(indx).getPortId();
+		OFPort inPort = switchPortList.get(indx + 1).getPortId();
+		mb.setExact(MatchField.VLAN_VID, OFVlanVidMatch.ofVlan(idVlan));
+		mb.setExact(MatchField.ETH_DST,macDestino);
+		if(puertoTCP!=0){
+			mb.setExact(MatchField.ETH_TYPE, EthType.IPv4);
+			mb.setExact(MatchField.IP_PROTO, IpProtocol.TCP);
+			mb.setExact(MatchField.TCP_SRC, TransportPort.of(puertoTCP));
+		}
+		aob.setPort(outPort);
+		aob.setMaxLen(Integer.MAX_VALUE);
+		actions.add(aob.build());
+
+		if (FLOWMOD_DEFAULT_SET_SEND_FLOW_REM_FLAG || requestFlowRemovedNotification) {
+			Set<OFFlowModFlags> flags = new HashSet<>();
+			flags.add(OFFlowModFlags.SEND_FLOW_REM);
+			fmb.setFlags(flags);
+		}
+
+		fmb.setMatch(mb.build())
+				.setIdleTimeout(idleTimeout)
+				.setHardTimeout(hardTimeout)
+				.setBufferId(OFBufferId.NO_BUFFER)
+				.setCookie(cookie)
+				.setOutPort(outPort)
+				.setPriority(priority);
+
+		FlowModUtils.setActions(fmb, actions, sw);
+
+		try {
+			if (log.isTraceEnabled()) {
+				log.trace("Pushing Route flowmod routeIndx={} " +
+								"sw={} inPort={} outPort={}",
+						new Object[] {indx,
+								sw,
+								fmb.getMatch().get(MatchField.IN_PORT),
+								outPort });
+			}
+
+			if (OFDPAUtils.isOFDPASwitch(sw)) {
+				OFDPAUtils.addLearningSwitchFlow(sw, cookie,
+						FLOWMOD_DEFAULT_PRIORITY,
+						FLOWMOD_DEFAULT_HARD_TIMEOUT,
+						FLOWMOD_DEFAULT_IDLE_TIMEOUT,
+						fmb.getMatch(),
+						null, // TODO how to determine output VLAN for lookup of L2 interface group
+						outPort);
+			} else {
+				messageDamper.write(sw, fmb.build());
+			}
+
+			/* Push the packet out the first hop switch */
+			if (sw.getId().equals(pinSwitch) &&
+					!fmb.getCommand().equals(OFFlowModCommand.DELETE) &&
+					!fmb.getCommand().equals(OFFlowModCommand.DELETE_STRICT)) {
+				/* Use the buffered packet at the switch, if there's one stored */
+				pushPacket(sw, pi, outPort, true, cntx);
+				packetOutSent = true;
+			}
+		} catch (IOException e) {
+			log.error("Failure writing flow mod", e);
+		}
+		return packetOutSent;
+	}
+
+	public boolean insertarRutaSwitchInicialIda(MacAddress macOrigen,MacAddress macDestino,IOFSwitch sw,Match match,List<NodePortTuple>switchPortList,boolean requestFlowRemovedNotification,OFFlowMod.Builder fmb,boolean packetOutSent,Integer idVlan,Integer indx,Integer idleTimeout,Integer hardTimeout,Integer priority,U64 cookie,DatapathId pinSwitch,OFPacketIn pi,FloodlightContext cntx,Integer puertoTCP){
+		OFActionOutput.Builder aob = sw.getOFFactory().actions().buildOutput();
+		List<OFAction> actions = new ArrayList<OFAction>();
+
+		actions.add(sw.getOFFactory().actions()
+				.buildPushVlan()
+				.setEthertype(EthType.VLAN_FRAME)
+				.build());
+
+		actions.add(sw.getOFFactory().actions()
+				.buildSetField()
+				.setField(
+						sw.getOFFactory().oxms()
+								.vlanVid(OFVlanVidMatch.ofVlan(idVlan))
+				)
+				.build());
+
+		Match.Builder mb = MatchUtils.convertToVersion(match, sw.getOFFactory().getVersion());
+
+		// set input and output ports on the switch
+		OFPort inPort = switchPortList.get(0).getPortId();
+		OFPort outPort = switchPortList.get(1).getPortId();
+		mb.setExact(MatchField.ETH_DST, macDestino);
+		mb.setExact(MatchField.ETH_SRC, macOrigen);
+		if(puertoTCP!=0){
+			mb.setExact(MatchField.ETH_TYPE, EthType.IPv4);
+			mb.setExact(MatchField.IP_PROTO, IpProtocol.TCP);
+			mb.setExact(MatchField.TCP_DST, TransportPort.of(puertoTCP));
+		}
+		aob.setPort(outPort);
+		aob.setMaxLen(Integer.MAX_VALUE);
+		actions.add(aob.build());
+
+		if (FLOWMOD_DEFAULT_SET_SEND_FLOW_REM_FLAG || requestFlowRemovedNotification) {
+			Set<OFFlowModFlags> flags = new HashSet<>();
+			flags.add(OFFlowModFlags.SEND_FLOW_REM);
+			fmb.setFlags(flags);
+		}
+
+		fmb.setMatch(mb.build())
+				.setIdleTimeout(idleTimeout)
+				.setHardTimeout(hardTimeout)
+				.setBufferId(OFBufferId.NO_BUFFER)
+				.setCookie(cookie)
+				.setOutPort(outPort)
+				.setPriority(priority);
+
+		FlowModUtils.setActions(fmb, actions, sw);
+
+		try {
+			if (log.isTraceEnabled()) {
+				log.trace("Pushing Route flowmod routeIndx={} " +
+								"sw={} inPort={} outPort={}",
+						new Object[] {indx,
+								sw,
+								fmb.getMatch().get(MatchField.IN_PORT),
+								outPort });
+			}
+
+			if (OFDPAUtils.isOFDPASwitch(sw)) {
+				OFDPAUtils.addLearningSwitchFlow(sw, cookie,
+						FLOWMOD_DEFAULT_PRIORITY,
+						FLOWMOD_DEFAULT_HARD_TIMEOUT,
+						FLOWMOD_DEFAULT_IDLE_TIMEOUT,
+						fmb.getMatch(),
+						null, // TODO how to determine output VLAN for lookup of L2 interface group
+						outPort);
+			} else {
+				messageDamper.write(sw, fmb.build());
+			}
+
+			/* Push the packet out the first hop switch */
+			if (sw.getId().equals(pinSwitch) &&
+					!fmb.getCommand().equals(OFFlowModCommand.DELETE) &&
+					!fmb.getCommand().equals(OFFlowModCommand.DELETE_STRICT)) {
+				/* Use the buffered packet at the switch, if there's one stored */
+				pushPacket(sw, pi, outPort, true, cntx);
+				packetOutSent = true;
+			}
+		} catch (IOException e) {
+			log.error("Failure writing flow mod", e);
+		}
+		return packetOutSent;
+	}
+
+	public boolean insertarRutaSwitchInicialRegreso(MacAddress macOrigen,MacAddress macDestino,IOFSwitch sw,Match match,List<NodePortTuple>switchPortList,boolean requestFlowRemovedNotification,OFFlowMod.Builder fmb,boolean packetOutSent,Integer idVlan,Integer indx,Integer idleTimeout,Integer hardTimeout,Integer priority,U64 cookie,DatapathId pinSwitch,OFPacketIn pi,FloodlightContext cntx,Integer puertoTCP){
+		OFActionOutput.Builder aob = sw.getOFFactory().actions().buildOutput();
+		List<OFAction> actions = new ArrayList<OFAction>();
+
+		actions.add(sw.getOFFactory().actions()
+				.buildPushVlan()
+				.setEthertype(EthType.VLAN_FRAME)
+				.build());
+
+		actions.add(sw.getOFFactory().actions()
+				.buildSetField()
+				.setField(
+						sw.getOFFactory().oxms()
+								.vlanVid(OFVlanVidMatch.ofVlan(idVlan))
+				)
+				.build());
+
+		Match.Builder mb = MatchUtils.convertToVersion(match, sw.getOFFactory().getVersion());
+
+		// set input and output ports on the switch
+		OFPort outPort = switchPortList.get(indx).getPortId();
+		OFPort inPort = switchPortList.get(indx+1).getPortId();
+		mb.setExact(MatchField.ETH_SRC, macOrigen);
+		mb.setExact(MatchField.ETH_DST, macDestino);
+		if(puertoTCP!=0){
+			mb.setExact(MatchField.ETH_TYPE, EthType.IPv4);
+			mb.setExact(MatchField.IP_PROTO, IpProtocol.TCP);
+			mb.setExact(MatchField.TCP_SRC, TransportPort.of(puertoTCP));
+		}
+		aob.setPort(outPort);
+		aob.setMaxLen(Integer.MAX_VALUE);
+		actions.add(aob.build());
+
+		if (FLOWMOD_DEFAULT_SET_SEND_FLOW_REM_FLAG || requestFlowRemovedNotification) {
+			Set<OFFlowModFlags> flags = new HashSet<>();
+			flags.add(OFFlowModFlags.SEND_FLOW_REM);
+			fmb.setFlags(flags);
+		}
+
+		fmb.setMatch(mb.build())
+				.setIdleTimeout(idleTimeout)
+				.setHardTimeout(hardTimeout)
+				.setBufferId(OFBufferId.NO_BUFFER)
+				.setCookie(cookie)
+				.setOutPort(outPort)
+				.setPriority(priority);
+
+		FlowModUtils.setActions(fmb, actions, sw);
+
+		try {
+			if (log.isTraceEnabled()) {
+				log.trace("Pushing Route flowmod routeIndx={} " +
+								"sw={} inPort={} outPort={}",
+						new Object[] {indx,
+								sw,
+								fmb.getMatch().get(MatchField.IN_PORT),
+								outPort });
+			}
+
+			if (OFDPAUtils.isOFDPASwitch(sw)) {
+				OFDPAUtils.addLearningSwitchFlow(sw, cookie,
+						FLOWMOD_DEFAULT_PRIORITY,
+						FLOWMOD_DEFAULT_HARD_TIMEOUT,
+						FLOWMOD_DEFAULT_IDLE_TIMEOUT,
+						fmb.getMatch(),
+						null, // TODO how to determine output VLAN for lookup of L2 interface group
+						outPort);
+			} else {
+				messageDamper.write(sw, fmb.build());
+			}
+
+			/* Push the packet out the first hop switch */
+			if (sw.getId().equals(pinSwitch) &&
+					!fmb.getCommand().equals(OFFlowModCommand.DELETE) &&
+					!fmb.getCommand().equals(OFFlowModCommand.DELETE_STRICT)) {
+				/* Use the buffered packet at the switch, if there's one stored */
+				pushPacket(sw, pi, outPort, true, cntx);
+				packetOutSent = true;
+			}
+		} catch (IOException e) {
+			log.error("Failure writing flow mod", e);
+		}
+		return packetOutSent;
+	}
+
+	public boolean insertarRutaSwitchFinalIda(MacAddress macOrigen,MacAddress macDestino,IOFSwitch sw,Match match,List<NodePortTuple>switchPortList,boolean requestFlowRemovedNotification,OFFlowMod.Builder fmb,boolean packetOutSent,Integer idVlan,Integer indx,Integer idleTimeout,Integer hardTimeout,Integer priority,U64 cookie,DatapathId pinSwitch,OFPacketIn pi,FloodlightContext cntx,Integer puertoTCP){
+		OFActionOutput.Builder aob = sw.getOFFactory().actions().buildOutput();
+		List<OFAction> actions = new ArrayList<OFAction>();
+		actions.add(sw.getOFFactory().actions().popVlan());
+		Match.Builder mb = MatchUtils.convertToVersion(match, sw.getOFFactory().getVersion());
+		mb.setExact(MatchField.VLAN_VID, OFVlanVidMatch.ofVlan(idVlan));
+		mb.setExact(MatchField.ETH_DST, macDestino);
+		if(puertoTCP!=0){
+			mb.setExact(MatchField.ETH_TYPE, EthType.IPv4);
+			mb.setExact(MatchField.IP_PROTO, IpProtocol.TCP);
+			mb.setExact(MatchField.TCP_DST, TransportPort.of(puertoTCP));
+		}
+		OFPort outPort = switchPortList.get(indx+1).getPortId();
+		OFPort inPort = switchPortList.get(indx).getPortId();
+		aob.setPort(outPort);
+		aob.setMaxLen(Integer.MAX_VALUE);
+		actions.add(aob.build());
+		if (FLOWMOD_DEFAULT_SET_SEND_FLOW_REM_FLAG || requestFlowRemovedNotification) {
+			Set<OFFlowModFlags> flags = new HashSet<>();
+			flags.add(OFFlowModFlags.SEND_FLOW_REM);
+			fmb.setFlags(flags);
+		}
+		fmb.setMatch(mb.build())
+				.setIdleTimeout(idleTimeout)
+				.setHardTimeout(hardTimeout)
+				.setBufferId(OFBufferId.NO_BUFFER)
+				.setCookie(cookie)
+				.setOutPort(outPort)
+				.setPriority(priority);
+		FlowModUtils.setActions(fmb, actions, sw);
+		try {
+			if (log.isTraceEnabled()) {
+				log.trace("Pushing Route flowmod routeIndx={} " +
+								"sw={} inPort={} outPort={}",
+						new Object[] {indx,
+								sw,
+								fmb.getMatch().get(MatchField.IN_PORT),
+								outPort });
+			}
+			if (OFDPAUtils.isOFDPASwitch(sw)) {
+				OFDPAUtils.addLearningSwitchFlow(sw, cookie,
+						FLOWMOD_DEFAULT_PRIORITY,
+						FLOWMOD_DEFAULT_HARD_TIMEOUT,
+						FLOWMOD_DEFAULT_IDLE_TIMEOUT,
+						fmb.getMatch(),
+						null, // TODO how to determine output VLAN for lookup of L2 interface group
+						outPort);
+			} else {
+				messageDamper.write(sw, fmb.build());
+			}
+			/* Push the packet out the first hop switch */
+			if (sw.getId().equals(pinSwitch) &&
+					!fmb.getCommand().equals(OFFlowModCommand.DELETE) &&
+					!fmb.getCommand().equals(OFFlowModCommand.DELETE_STRICT)) {
+				/* Use the buffered packet at the switch, if there's one stored */
+				pushPacket(sw, pi, outPort, true, cntx);
+				packetOutSent = true;
+			}
+		} catch (IOException e) {
+			log.error("Failure writing flow mod", e);
+		}
+		return packetOutSent;
+	}
+
+	public boolean insertarRutaSwitchFinalRegreso(MacAddress macOrigen,MacAddress macDestino,IOFSwitch sw,Match match,List<NodePortTuple>switchPortList,boolean requestFlowRemovedNotification,OFFlowMod.Builder fmb,boolean packetOutSent,Integer idVlan,Integer indx,Integer idleTimeout,Integer hardTimeout,Integer priority,U64 cookie,DatapathId pinSwitch,OFPacketIn pi,FloodlightContext cntx,Integer puertoTCP){
+		OFActionOutput.Builder aob = sw.getOFFactory().actions().buildOutput();
+		List<OFAction> actions = new ArrayList<OFAction>();
+		actions.add(sw.getOFFactory().actions().popVlan());
+		Match.Builder mb = MatchUtils.convertToVersion(match, sw.getOFFactory().getVersion());
+		mb.setExact(MatchField.VLAN_VID, OFVlanVidMatch.ofVlan(idVlan));
+		mb.setExact(MatchField.ETH_DST, macDestino);
+		if(puertoTCP!=0){
+			mb.setExact(MatchField.ETH_TYPE, EthType.IPv4);
+			mb.setExact(MatchField.IP_PROTO, IpProtocol.TCP);
+			mb.setExact(MatchField.TCP_SRC, TransportPort.of(puertoTCP));
+		}
+		OFPort outPort = switchPortList.get(indx).getPortId();
+		OFPort inPort = switchPortList.get(indx+1).getPortId();
+		aob.setPort(outPort);
+		aob.setMaxLen(Integer.MAX_VALUE);
+		actions.add(aob.build());
+		if (FLOWMOD_DEFAULT_SET_SEND_FLOW_REM_FLAG || requestFlowRemovedNotification) {
+			Set<OFFlowModFlags> flags = new HashSet<>();
+			flags.add(OFFlowModFlags.SEND_FLOW_REM);
+			fmb.setFlags(flags);
+		}
+		fmb.setMatch(mb.build())
+				.setIdleTimeout(idleTimeout)
+				.setHardTimeout(hardTimeout)
+				.setBufferId(OFBufferId.NO_BUFFER)
+				.setCookie(cookie)
+				.setOutPort(outPort)
+				.setPriority(priority);
+		FlowModUtils.setActions(fmb, actions, sw);
+		try {
+			if (log.isTraceEnabled()) {
+				log.trace("Pushing Route flowmod routeIndx={} " +
+								"sw={} inPort={} outPort={}",
+						new Object[] {indx,
+								sw,
+								fmb.getMatch().get(MatchField.IN_PORT),
+								outPort });
+			}
+			if (OFDPAUtils.isOFDPASwitch(sw)) {
+				OFDPAUtils.addLearningSwitchFlow(sw, cookie,
+						FLOWMOD_DEFAULT_PRIORITY,
+						FLOWMOD_DEFAULT_HARD_TIMEOUT,
+						FLOWMOD_DEFAULT_IDLE_TIMEOUT,
+						fmb.getMatch(),
+						null, // TODO how to determine output VLAN for lookup of L2 interface group
+						outPort);
+			} else {
+				messageDamper.write(sw, fmb.build());
+			}
+			/* Push the packet out the first hop switch */
+			if (sw.getId().equals(pinSwitch) &&
+					!fmb.getCommand().equals(OFFlowModCommand.DELETE) &&
+					!fmb.getCommand().equals(OFFlowModCommand.DELETE_STRICT)) {
+				/* Use the buffered packet at the switch, if there's one stored */
+				pushPacket(sw, pi, outPort, true, cntx);
+				packetOutSent = true;
+			}
+		} catch (IOException e) {
+			log.error("Failure writing flow mod", e);
+		}
+		return packetOutSent;
+	}
+
 	/**
 	 * Pushes a packet-out to a switch. The assumption here is that
 	 * the packet-in was also generated from the same switch. Thus, if the input

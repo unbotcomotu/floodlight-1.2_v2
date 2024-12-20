@@ -24,7 +24,9 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
+import extra.HTTPRequests;
 import net.floodlightcontroller.core.FloodlightContext;
 import net.floodlightcontroller.core.IFloodlightProviderService;
 import net.floodlightcontroller.core.IOFSwitch;
@@ -40,11 +42,7 @@ import net.floodlightcontroller.debugcounter.IDebugCounterService;
 import net.floodlightcontroller.devicemanager.IDevice;
 import net.floodlightcontroller.devicemanager.IDeviceService;
 import net.floodlightcontroller.devicemanager.SwitchPort;
-import net.floodlightcontroller.packet.Ethernet;
-import net.floodlightcontroller.packet.IPv4;
-import net.floodlightcontroller.packet.IPv6;
-import net.floodlightcontroller.packet.TCP;
-import net.floodlightcontroller.packet.UDP;
+import net.floodlightcontroller.packet.*;
 import net.floodlightcontroller.routing.ForwardingBase;
 import net.floodlightcontroller.routing.IRoutingDecision;
 import net.floodlightcontroller.routing.IRoutingService;
@@ -79,16 +77,26 @@ import org.projectfloodlight.openflow.types.OFVlanVidMatch;
 import org.projectfloodlight.openflow.types.TableId;
 import org.projectfloodlight.openflow.types.U64;
 import org.projectfloodlight.openflow.types.VlanVid;
+import org.python.antlr.ast.Str;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 public class Forwarding extends ForwardingBase implements IFloodlightModule, IOFSwitchListener {
 	protected static Logger log = LoggerFactory.getLogger(Forwarding.class);
 
+	private final ConcurrentHashMap<String, Long> connectionRequests = new ConcurrentHashMap<>();
+	private static final long TIMEOUT_MS = 5000;
+
+	private String generateConnectionKey(String macSrc, String macDst) {
+		return macSrc + "->" + macDst;
+	}
+
 	@Override
 	public Command processPacketInMessage(IOFSwitch sw, OFPacketIn pi, IRoutingDecision decision, FloodlightContext cntx) {
 		Ethernet eth = IFloodlightProviderService.bcStore.get(cntx, IFloodlightProviderService.CONTEXT_PI_PAYLOAD);
 		// We found a routing decision (i.e. Firewall is enabled... it's the only thing that makes RoutingDecisions)
+		// Filtrar paquetes no relevantes (no IPv4 o no ICMP)
+
 		if (decision != null) {
 			if (log.isTraceEnabled()) {
 				log.trace("Forwarding decision={} was made for PacketIn={}", decision.getRoutingAction().toString(), pi);
@@ -117,7 +125,6 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 			if (log.isTraceEnabled()) {
 				log.trace("No decision was made for PacketIn={}, forwarding", pi);
 			}
-
 			if (eth.isBroadcast() || eth.isMulticast()) {
 				doFlood(sw, pi, cntx);
 			} else {
@@ -131,6 +138,7 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 	protected void doDropFlow(IOFSwitch sw, OFPacketIn pi, IRoutingDecision decision, FloodlightContext cntx) {
 		OFPort inPort = (pi.getVersion().compareTo(OFVersion.OF_12) < 0 ? pi.getInPort() : pi.getMatch().get(MatchField.IN_PORT));
 		Match m = createMatchFromPacket(sw, inPort, cntx);
+
 		OFFlowMod.Builder fmb = sw.getOFFactory().buildFlowAdd(); // this will be a drop-flow; a flow that will not output to any ports
 		List<OFAction> actions = new ArrayList<OFAction>(); // set no action to drop
 		U64 cookie = AppCookie.makeCookie(FORWARDING_APP_ID, 0);
@@ -160,15 +168,40 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 		OFPort inPort = (pi.getVersion().compareTo(OFVersion.OF_12) < 0 ? pi.getInPort() : pi.getMatch().get(MatchField.IN_PORT));
 		IDevice dstDevice = IDeviceService.fcStore.get(cntx, IDeviceService.CONTEXT_DST_DEVICE);
 		DatapathId source = sw.getId();
-				
+
+		Integer idleTimeout=600;
+		Integer hardTimeout=0;
+		Integer priority=100;
+		Ethernet eth = IFloodlightProviderService.bcStore.get(cntx, IFloodlightProviderService.CONTEXT_PI_PAYLOAD);
+
+// Obtener direcciones MAC de origen y destino
+		String macSrc = eth.getSourceMACAddress().toString();
+		String macDst = eth.getDestinationMACAddress().toString();
+
+		// Generar clave para la conexión
+		String connectionKey = generateConnectionKey(macSrc, macDst);
+		String connectionKeyInversed = generateConnectionKey(macDst, macSrc);
+
+		// Verificar si la conexión ya fue procesada
+		Long timestamp = connectionRequests.get(connectionKeyInversed);
+		long currentTime = System.currentTimeMillis();
+
+		if (timestamp != null && (currentTime - timestamp) < TIMEOUT_MS) {
+			log.info("Solicitud de conexión ya procesada para {}", connectionKey);
+			return;
+		}
+
+
 		if (dstDevice != null) {
 			IDevice srcDevice = IDeviceService.fcStore.get(cntx, IDeviceService.CONTEXT_SRC_DEVICE);
+
 
 			if (srcDevice == null) {
 				log.error("No device entry found for source device. Is the device manager running? If so, report bug.");
 				return;
 			}
-			
+			log.info("----- Solicitud PACKET-IN entre "+srcDevice.getMACAddressString()+" y "+dstDevice.getMACAddressString()+" -----");
+
 			if (FLOOD_ALL_ARP_PACKETS && 
 					IFloodlightProviderService.bcStore.get(cntx, IFloodlightProviderService.CONTEXT_PI_PAYLOAD).getEtherType() 
 					== EthType.ARP) {
@@ -194,12 +227,12 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 			SwitchPort[] dstDaps = dstDevice.getAttachmentPoints();
 			SwitchPort dstDap = null;
 
-			/* 
+			/*
 			 * Search for the true attachment point. The true AP is
 			 * not an endpoint of a link. It is a switch port w/o an
 			 * associated link. Note this does not necessarily hold
 			 * true for devices that 'live' between OpenFlow islands.
-			 * 
+			 *
 			 * TODO Account for the case where a device is actually
 			 * attached between islands (possibly on a non-OF switch
 			 * in between two OpenFlow switches).
@@ -209,9 +242,9 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 					dstDap = ap;
 					break;
 				}
-			}	
+			}
 
-			/* 
+			/*
 			 * This should only happen (perhaps) when the controller is
 			 * actively learning a new topology and hasn't discovered
 			 * all links yet, or a switch was in standalone mode and the
@@ -221,7 +254,7 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 			if (dstDap == null) {
 				log.warn("Could not locate edge attachment point for device {}. Flooding packet");
 				doFlood(sw, pi, cntx);
-				return; 
+				return;
 			}
 			
 			/* It's possible that we learned packed destination while it was in flight */
@@ -229,18 +262,155 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 				log.debug("Packet destination is known, but packet was not received on an edge port (rx on {}/{}). Flooding packet", source, inPort);
 				doFlood(sw, pi, cntx);
 				return; 
-			}				
-			
-			Route route = routingEngineService.getRoute(source, 
-					inPort,
-					dstDap.getSwitchDPID(),
-					dstDap.getPort(), U64.of(0)); //cookie = 0, i.e., default route
+			}
 
-			Match m = createMatchFromPacket(sw, inPort, cntx);
+			IDevice srcDeviceAux=dstDevice;
+			IDevice dstDeviceAux=srcDevice;
+
+			log.info("----- Solicitud PACKET-IN entre "+srcDevice.getMACAddressString()+" y "+dstDevice.getMACAddressString()+" -----");
+			log.info("----- El motivo es una comunicación entre "+srcDeviceAux.getMACAddressString()+" y "+dstDeviceAux.getMACAddressString()+" -----");
+
+			Boolean hostOrigenInvitado=false;
+			Boolean hostDestinoInvitado=false;
+
+			Map<String,Object> dispositivoOrigenResponse=(Map<String,Object>) HTTPRequests.obtenerDispositivo(srcDeviceAux.getMACAddressString());
+			String status=(String) dispositivoOrigenResponse.get("status");
+			log.info("----- STATUS src: "+status+" -----");
+			if(status.equals("error")){
+				hostOrigenInvitado=true;
+				HTTPRequests.registrarDispositivoInvitado(srcDeviceAux.getMACAddressString());
+				log.info("----- Se registró un nuevo dispositivo origen invitado: "+srcDeviceAux.getMACAddressString()+" -----");
+			}else{
+				Map<String,Object>dispositivo=(Map<String,Object>)dispositivoOrigenResponse.get("content");
+				Object usuario=dispositivo.get("usuario");
+				if(usuario==null){
+					hostOrigenInvitado=true;
+					log.info("----- El dispositivo origen está registrado como invitado: "+srcDeviceAux.getMACAddressString()+" -----");
+				}else if(dispositivo.get("autenticado").equals(0)){
+					hostOrigenInvitado=true;
+					log.info("----- El dispositivo origen no ha sido autenticado por su usuario: "+srcDeviceAux.getMACAddressString()+" -----");
+				}else {
+					Map<String,Object>enSesionResponse=(Map<String, Object>) HTTPRequests.verificarUsuarioEnSesion((String) ((Map<String,Object>)usuario).get("username"));
+					if(enSesionResponse.get("status").equals("error")){
+						log.info("----- El usuario que registró al dispositivo origen no está en sesión: "+srcDeviceAux.getMACAddressString()+" -----");
+						hostOrigenInvitado=true;
+					}else {
+						log.info("----- El dispositivo origen pasará a una segunda validación: "+srcDeviceAux.getMACAddressString()+" -----");
+					}
+				}
+			}
+
+			Map<String,Object> dispositivoDestinoResponse=(Map<String,Object>)HTTPRequests.obtenerDispositivo(dstDeviceAux.getMACAddressString());
+			status=(String) dispositivoDestinoResponse.get("status");
+			log.info("----- STATUS dst: "+status+" -----");
+			if(status.equals("error")){
+				hostDestinoInvitado=true;
+				HTTPRequests.registrarDispositivoInvitado(dstDeviceAux.getMACAddressString());
+				log.info("----- Se registró un nuevo dispositivo destino invitado: "+dstDeviceAux.getMACAddressString()+" -----");
+			}else{
+				Map<String,Object>dispositivo=(Map<String,Object>)dispositivoDestinoResponse.get("content");
+				Object usuario=dispositivo.get("usuario");
+				Integer autenticado = ((Double) dispositivo.get("autenticado")).intValue();
+				if(usuario==null){
+					log.info("----- El dispositivo destino está registrado como invitado: "+dstDeviceAux.getMACAddressString()+" -----");
+					hostDestinoInvitado=true;
+				}else if(autenticado==0||autenticado==1){
+					log.info("----- El dispositivo destino no ha sido autenticado por su usuario o este desea que sea accesible como invitado: "+dstDevice.getMACAddressString()+" -----");
+					hostDestinoInvitado=true;
+				}else {
+					Map<String,Object>enSesionResponse=(Map<String, Object>) HTTPRequests.verificarUsuarioEnSesion((String) ((Map<String,Object>)usuario).get("username"));
+					if(enSesionResponse.get("status").equals("error")){
+						hostOrigenInvitado=true;
+						log.info("----- El usuario que registró al dispositivo destino no está en sesión: "+dstDeviceAux.getMACAddressString()+" -----");
+					}else {
+						log.info("----- El dispositivo destino pasará a una segunda validación: "+dstDeviceAux.getMACAddressString()+" -----");
+					}
+				}
+			}
+			log.info("----- Host origen invitado: "+hostOrigenInvitado+" -----");
+			log.info("----- Host destino invitado: "+hostDestinoInvitado+" -----");
+			Integer idVlan=null;
+			Integer puerto=0;
+			String nombreServicio=null;
+
+
+			Integer puertoDestino=null;
+
+			// Verificar si el paquete es IPv4
+			if (eth.getEtherType() == EthType.IPv4) {
+				IPv4 ipv4 = (IPv4) eth.getPayload();
+
+				// Verificar si el protocolo es TCP
+				if (ipv4.getProtocol() == IpProtocol.TCP) {
+					TCP tcp = (TCP) ipv4.getPayload();
+
+					// Obtener el puerto destino
+					puertoDestino = tcp.getDestinationPort().getPort();
+
+					log.info("Puerto TCP destino: {}", puertoDestino);
+				}
+			}
+
+			if(hostOrigenInvitado){
+				if(hostDestinoInvitado){
+					idVlan=1;
+				}else {
+					idVlan=null;
+				}
+			}else {
+				if(hostDestinoInvitado){
+					idVlan=1;
+				}else {
+					Map<String,Object>vinculoResponse=(Map<String, Object>) HTTPRequests.obtenerVinculoTerminales(srcDeviceAux.getMACAddressString(),dstDeviceAux.getMACAddressString());
+					Map<String,Object>content=(Map<String,Object>) vinculoResponse.get("content");
+					Map<String,Object>servicio=(Map<String,Object>) content.get("servicio");
+					if(servicio!=null){
+						idVlan=((Double) servicio.get("id")).intValue();
+						nombreServicio=(String) servicio.get("nombre");
+						List<Integer>listaPuertosServicio=(List<Integer>)servicio.get("puertos");
+						if(listaPuertosServicio.isEmpty()){
+							puerto=0;
+						}else {
+							if(listaPuertosServicio.contains(puertoDestino)){
+								puerto=puertoDestino;
+							}else {
+								puerto=null;
+							}
+						}
+					}
+				}
+			}
+
+			if(idVlan==null){
+				log.error("----- No se obtuvo un valor de ID VLAN válido. No se puede establecer una conexión con el destino -----");
+				// Agregar la conexión al registro
+				connectionRequests.put(connectionKey, currentTime);
+				return;
+			}else {
+				if(puerto==null){
+					log.error("----- El puerto destino no es permitido. No se puede establecer una conexión con el destino -----");
+					// Agregar la conexión al registro
+					connectionRequests.put(connectionKey, currentTime);
+					return;
+				}
+			}
+			log.info("----- Servicio en comun: "+(nombreServicio==null?"Invitado":nombreServicio)+" con ID VLAN: "+idVlan+" y puerto "+(puerto==0?"0 (todos los puertos)":puerto)+" -----");
+
+			log.info("----- Se está iniciando la creación de una conexión entre "+srcDeviceAux.getMACAddressString()+" y "+dstDeviceAux.getMACAddressString()+" -----");
+
+
+
+			Route route = routingEngineService.getRoute(dstDap.getSwitchDPID(),
+					dstDap.getPort(),
+					source,
+					inPort, U64.of(0)); //cookie = 0, i.e., default route
+
+			Match m = crearMatchInicialPorPaquete(sw, inPort, cntx,puerto);
+
 			U64 cookie = AppCookie.makeCookie(FORWARDING_APP_ID, 0);
-			
+
 			if (route != null) {
-				log.debug("pushRoute inPort={} route={} " +
+				log.info("pushRoute inPort={} route={} " +
 						"destination={}:{}",
 						new Object[] { inPort, route,
 						dstDap.getSwitchDPID(),
@@ -248,12 +418,19 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 
 
 				log.debug("Cretaing flow rules on the route, match rule: {}", m);
-				pushRoute(route, m, pi, sw.getId(), cookie, 
+				insertarRutas(route, m, pi, sw.getId(), cookie,
 						cntx, requestFlowRemovedNotifn,
-						OFFlowModCommand.ADD);	
+						OFFlowModCommand.ADD,
+						eth.getSourceMACAddress(),
+						eth.getDestinationMACAddress(),
+						idleTimeout,
+						hardTimeout,
+						idVlan,
+						priority,
+						puerto);
 			} else {
 				/* Route traverses no links --> src/dst devices on same switch */
-				log.debug("Could not compute route. Devices should be on same switch src={} and dst={}", srcDevice, dstDevice);
+				log.info("Could not compute route. Devices should be on same switch src={} and dst={}", srcDevice, dstDevice);
 				Route r = new Route(srcDevice.getAttachmentPoints()[0].getSwitchDPID(), dstDevice.getAttachmentPoints()[0].getSwitchDPID());
 				List<NodePortTuple> path = new ArrayList<NodePortTuple>(2);
 				path.add(new NodePortTuple(srcDevice.getAttachmentPoints()[0].getSwitchDPID(),
@@ -261,10 +438,20 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 				path.add(new NodePortTuple(dstDevice.getAttachmentPoints()[0].getSwitchDPID(),
 						dstDevice.getAttachmentPoints()[0].getPort()));
 				r.setPath(path);
-				pushRoute(r, m, pi, sw.getId(), cookie,
+				insertarRutas(r, m, pi, sw.getId(), cookie,
 						cntx, requestFlowRemovedNotifn,
-						OFFlowModCommand.ADD);
+						OFFlowModCommand.ADD,
+						eth.getSourceMACAddress(),
+						eth.getDestinationMACAddress(),
+						idleTimeout,
+						hardTimeout,
+						idVlan,
+						priority,
+						puerto);
 			}
+			HTTPRequests.registrarNuevaConexion(srcDeviceAux.getMACAddressString(), dstDeviceAux.getMACAddressString(),idVlan,puerto,idleTimeout);
+			System.out.println("----- Se estableció una conexión entre "+srcDeviceAux.getMACAddressString()+" y "+dstDeviceAux.getMACAddressString()+" -----");
+
 		} else {
 			log.debug("Destination unknown. Flooding packet");
 			doFlood(sw, pi, cntx);
@@ -309,11 +496,11 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 			IPv4 ip = (IPv4) eth.getPayload();
 			IPv4Address srcIp = ip.getSourceAddress();
 			IPv4Address dstIp = ip.getDestinationAddress();
-			
+
 			if (FLOWMOD_DEFAULT_MATCH_IP_ADDR) {
 				mb.setExact(MatchField.ETH_TYPE, EthType.IPv4)
-				.setExact(MatchField.IPV4_SRC, srcIp)
-				.setExact(MatchField.IPV4_DST, dstIp);
+						.setExact(MatchField.IPV4_SRC, srcIp)
+						.setExact(MatchField.IPV4_DST, dstIp);
 			}
 
 			if (FLOWMOD_DEFAULT_MATCH_TRANSPORT) {
@@ -324,17 +511,17 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 				if (!FLOWMOD_DEFAULT_MATCH_IP_ADDR) {
 					mb.setExact(MatchField.ETH_TYPE, EthType.IPv4);
 				}
-				
+
 				if (ip.getProtocol().equals(IpProtocol.TCP)) {
 					TCP tcp = (TCP) ip.getPayload();
 					mb.setExact(MatchField.IP_PROTO, IpProtocol.TCP)
-					.setExact(MatchField.TCP_SRC, tcp.getSourcePort())
-					.setExact(MatchField.TCP_DST, tcp.getDestinationPort());
+							.setExact(MatchField.TCP_SRC, tcp.getSourcePort())
+							.setExact(MatchField.TCP_DST, tcp.getDestinationPort());
 				} else if (ip.getProtocol().equals(IpProtocol.UDP)) {
 					UDP udp = (UDP) ip.getPayload();
 					mb.setExact(MatchField.IP_PROTO, IpProtocol.UDP)
-					.setExact(MatchField.UDP_SRC, udp.getSourcePort())
-					.setExact(MatchField.UDP_DST, udp.getDestinationPort());
+							.setExact(MatchField.UDP_SRC, udp.getSourcePort())
+							.setExact(MatchField.UDP_DST, udp.getDestinationPort());
 				}
 			}
 		} else if (eth.getEtherType() == EthType.ARP) { /* shallow check for equality is okay for EthType */
@@ -343,11 +530,11 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 			IPv6 ip = (IPv6) eth.getPayload();
 			IPv6Address srcIp = ip.getSourceAddress();
 			IPv6Address dstIp = ip.getDestinationAddress();
-			
+
 			if (FLOWMOD_DEFAULT_MATCH_IP_ADDR) {
 				mb.setExact(MatchField.ETH_TYPE, EthType.IPv6)
-				.setExact(MatchField.IPV6_SRC, srcIp)
-				.setExact(MatchField.IPV6_DST, dstIp);
+						.setExact(MatchField.IPV6_SRC, srcIp)
+						.setExact(MatchField.IPV6_DST, dstIp);
 			}
 
 			if (FLOWMOD_DEFAULT_MATCH_TRANSPORT) {
@@ -358,20 +545,29 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 				if (!FLOWMOD_DEFAULT_MATCH_IP_ADDR) {
 					mb.setExact(MatchField.ETH_TYPE, EthType.IPv6);
 				}
-				
+
 				if (ip.getNextHeader().equals(IpProtocol.TCP)) {
 					TCP tcp = (TCP) ip.getPayload();
 					mb.setExact(MatchField.IP_PROTO, IpProtocol.TCP)
-					.setExact(MatchField.TCP_SRC, tcp.getSourcePort())
-					.setExact(MatchField.TCP_DST, tcp.getDestinationPort());
+							.setExact(MatchField.TCP_SRC, tcp.getSourcePort())
+							.setExact(MatchField.TCP_DST, tcp.getDestinationPort());
 				} else if (ip.getNextHeader().equals(IpProtocol.UDP)) {
 					UDP udp = (UDP) ip.getPayload();
 					mb.setExact(MatchField.IP_PROTO, IpProtocol.UDP)
-					.setExact(MatchField.UDP_SRC, udp.getSourcePort())
-					.setExact(MatchField.UDP_DST, udp.getDestinationPort());
+							.setExact(MatchField.UDP_SRC, udp.getSourcePort())
+							.setExact(MatchField.UDP_DST, udp.getDestinationPort());
 				}
 			}
 		}
+		return mb.build();
+	}
+
+	protected Match crearMatchInicialPorPaquete(IOFSwitch sw, OFPort inPort, FloodlightContext cntx,Integer puerto) {
+		// The packet in match will only contain the port number.
+		// We need to add in specifics for the hosts we're routing between.
+		Ethernet eth = IFloodlightProviderService.bcStore.get(cntx, IFloodlightProviderService.CONTEXT_PI_PAYLOAD);
+
+		Match.Builder mb = sw.getOFFactory().buildMatch();
 		return mb.build();
 	}
 
@@ -573,4 +769,33 @@ public class Forwarding extends ForwardingBase implements IFloodlightModule, IOF
 	@Override
 	public void switchChanged(DatapathId switchId) {
 	}
+
+	protected void installFloodRule(IOFSwitch sw) {
+		// Match all ARP packets
+		Match match = sw.getOFFactory().buildMatch()
+				.setExact(MatchField.ETH_TYPE, EthType.ARP)
+				.build();
+
+		// Create the flood action
+		OFAction floodAction = sw.getOFFactory().actions().output(OFPort.FLOOD, Integer.MAX_VALUE);
+
+		// Build the flow modification message
+		OFFlowMod flowMod = sw.getOFFactory().buildFlowAdd()
+				.setMatch(match) // Match criteria (ARP packets)
+				.setActions(Collections.singletonList(floodAction)) // Flood action
+				.setIdleTimeout(600) // Rule expires after 600 seconds of inactivity
+				.setHardTimeout(0) // No hard timeout (doesn't expire automatically)
+				.setPriority(200) // Higher priority than default rules
+				.setBufferId(OFBufferId.NO_BUFFER) // No buffering
+				.build();
+
+		// Write the flow modification to the switch
+		try {
+			sw.write(flowMod);
+			log.info("Regla de Flooding ARP instalada en el switch {}", sw.getId());
+		} catch (Exception e) {
+			log.error("Error al instalar regla de Flooding ARP instalada en el switch {}", sw.getId(), e);
+		}
+	}
+
 }
